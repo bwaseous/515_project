@@ -1,6 +1,7 @@
 import os
 import json
 from time import time
+from copy import copy
 
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 import torch
+from torch.utils.data import DataLoader, Dataset
 from torch import nn, optim
 
 from transformers import (
@@ -17,7 +19,7 @@ from transformers import (
     RobertaTokenizerFast,
     RobertaConfig,
     MobileViTV2ForImageClassification,
-    MobileViTImageProcessor,
+    MobileViTFeatureExtractor,
     MobileViTV2Config,
     Trainer,
     TrainingArguments,
@@ -27,8 +29,8 @@ from transformers import (
 import datasets
 from datasets import load_dataset, load_metric
 
-from utils import create_dir, set_seed
-from model import RoadSafetyNet
+from project.utils import create_dir, set_seed
+from project.model import CreditDefaultNet
 
 from typing import List, Union, Optional, Dict, Tuple, Any, Literal
 
@@ -86,8 +88,7 @@ class BaseDataset:
     
 
 
-
-class RoadSafety(BaseDataset):
+class CreditDefault(BaseDataset):
 
     def __init__(
             self,
@@ -95,11 +96,10 @@ class RoadSafety(BaseDataset):
         ) -> None:
         super().__init__()
 
-        self.dataset_name: str = "road-safety"
+        self.dataset_name: str = "credit-default"
 
         self.dataset = load_dataset(
-            path = "inria-soda/tabular-benchmark",
-            data_files = "clf_cat/road-safety.csv"
+            path = "imodels/credit-card",
         )
 
         model: nn.Module = model
@@ -107,131 +107,162 @@ class RoadSafety(BaseDataset):
 
     def prepare_dataset(
             self, 
-            split: Optional[float] = 0.2, 
-            seed: Optional[int] = 1234
+            device: Literal["cpu", "cuda"]
         ) -> None:
-
-        dataset = self.dataset.train_test_split(split = split, seed = seed)
-        self.Train = dataset["train"]
-        self.Test = dataset["test"]
-
-        del dataset
+        self.device = device
+        
+        self.Train = self.dataset_to_tensor(self.dataset["train"].with_format("torch"))
+        self.Test = self.dataset_to_tensor(self.dataset["test"].with_format("torch"))
 
         return None
     
-    def load_model(self, device:Literal["cpu", "cuda"], model: Optional[nn.Module] = RoadSafetyNet) -> None:
-        self.model = model().to_device(device)
+    def dataset_to_tensor(
+            self,
+            d
+        ) -> torch.Tensor:
+        
+        n = len(d.features)
+        m = len(d)
+        
+        t = torch.zeros((m,n), device = self.device)
+        
+        for i, feature in enumerate(d.features):
+            t[:,i] = d[feature]
+            
+        return t
+    
+    def load_model(self, device:Literal["cpu", "cuda"], model: Optional[nn.Module] = CreditDefaultNet) -> None:
+        self.model = model().to(device)
         return None
 
-    def train_one_epoch(self, optimizer: optim.Optimizer, batch_size: int) -> float:
-        avg_loss = 0
+    def train_one_epoch(self, optimizer: optim.Optimizer, batch_size: int, shuffle: Optional[bool] = True) -> Tuple[List[float]]:
+        batch_loss = []
+        accuracy_list = []
 
-        idxs = np.arange(0, len(self.Train), batch_size)
-
-        for i, idx in enumerate(idxs):
+        dataloader = DataLoader(self.Train, batch_size, shuffle = shuffle)
+        
+        for i, batch in enumerate(dataloader):
             
             optimizer.zero_grad()
-            data = self.Train[idx:idx+batch_size]
-
-            outputs = self.model(list(data.values())[:-1]).detach().to_cpu()
-            loss = self.loss(outputs, data["SexofDriver"])
+            outputs = self.model(batch[:,:-1]).reshape(-1)
+            
+            loss = self.loss(outputs, batch[:,-1])
 
             loss.backward()
             optimizer.step()
+            accuracy = (outputs==batch[:,-1]).to('cpu').numpy().mean()
+            batch_loss.append(loss.item())
+            accuracy_list.append(accuracy)
+            print(f"\tbatch {i+1} | loss: {loss.item()} | accuracy: {accuracy}")
 
-            avg_loss += loss.item()
-
-            if i%batch_size == batch_size-1:
-                last_loss = avg_loss/(len(data["SexofDriver"]))
-                print(f"\tbatch {i+1} | loss: {last_loss}")
-                avg_loss = 0.
-
-        return last_loss
+        return batch_loss, accuracy_list
     
-    def test_one_epoch(self, batch_size: int) -> float:
+    def test_one_epoch(self, batch_size: int, shuffle: Optional[bool] = True) -> Tuple[List[float]]:
         self.model.eval()
-        avg_loss = 0.
-
-        idxs = np.arange(0,len(self.Test),batch_size)
+        batch_loss = []
+        accuracy_list = []
 
         with torch.no_grad():
-            for i, idx in enumerate(idxs):               
-                data = self.Test[idx:idx+batch_size]
+            dataloader = DataLoader(self.Test, batch_size, shuffle = shuffle)
+            
+            for i, batch in enumerate(dataloader):
 
-                outputs = self.model(list(data.values())[:-1]).detach().to_cpu()
-                loss = self.loss(outputs, data["SexofDriver"])
-
-                avg_loss += loss.item()
-
-                if i%batch_size == batch_size-1:
-                    last_loss = avg_loss/len(data["SexofDriver"])
-                    print(f"\tbatch {i+1} | loss: {last_loss}")
-                    avg_loss = 0.
+                outputs = self.model(batch[:,:-1]).reshape(-1)
                 
-        return last_loss
+                loss = self.loss(outputs, batch[:,-1])
+                accuracy = (outputs==batch[:,-1]).to('cpu').numpy().mean()
+                batch_loss.append(loss.item())
+                accuracy_list.append(accuracy)
+                print(f"\tbatch {i+1} | loss: {loss.item()} | accuracy: {accuracy}")
+                
+        return batch_loss, accuracy_list
                 
 
     def train(
             self,
             result_csv: Union[str, Path],
             optimizers: Dict[str, Tuple[optim.Optimizer, Dict[str, Any]]],
-            schedulers: Dict[str, Tuple[optim.lr_scheduler._LRScheduler, Dict[str, Any]]],
-            loss_func: Optional[nn.modules.loss._Loss] = nn.BCELoss,
+            schedulers: Dict[str, Tuple[optim.lr_scheduler.LRScheduler, Dict[str, Any]]],
+            loss_func: Optional[nn.modules.loss._Loss] = nn.MSELoss,
             epochs: Optional[int] = 50,
             batch_size: Optional[int] = 20,
-            model: Optional[nn.Module] = RoadSafetyNet,
+            model: Optional[nn.Module] = CreditDefaultNet,
             device: Optional[Literal["cpu", "cuda"]] = "cpu"
         ) -> pd.DataFrame:
 
-        self.loss: nn.modules.loss._Loss = loss_func
-
-        try:
-            df = pd.read_csv(result_csv)
-        except:
-            df = pd.DataFrame(
-                np.zeros((len(optimizers),len(schedulers))), 
-                index = list(optimizers.keys()), 
-                columns = list(schedulers.keys())
-            )
-            df.to_csv(result_csv)
+        self.device = device
+        
+        assert((self.Train != None) and (self.Test != None)), "run prepare_dataset method"
+        
+        self.loss: nn.modules.loss._Loss = loss_func()
+        
+        result_csv = Path(result_csv)
+        if not result_csv.parents[0].exists():
+            result_csv.parents[0].makedir(parents = True)
+        
+        df = pd.DataFrame(
+            index = list(optimizers.keys()), 
+            columns = list(schedulers.keys())
+        )
+        df.to_csv(result_csv)
 
         for scheduler_name, (scheduler, scheduler_params) in schedulers.items():
             for optimizer_name, (optimizer, optimizer_params) in optimizers.items():
                 t0 = time()
 
-                self.load_model(model, device)
-
+                self.load_model(model = model, device = device)
+                print(f"-------------------------------------")
                 print(f"|{scheduler_name}, {optimizer_name}|")
-                optimizer = optimizer(**optimizer_params)
-                scheduler = scheduler(optimizer, **scheduler_params)
+                _optimizer = copy(optimizer)(self.model.parameters(), **optimizer_params)
+                _scheduler = copy(scheduler)(_optimizer, **scheduler_params)
                 
-                best_loss = np.nan
+                best_loss = 1000.
 
-                run_data = {"train_loss": [], "test_loss": [], "train_time": 0.,}
+                run_data = {
+                    "train_loss": [], 
+                    "test_loss": [], 
+                    "train_accuracy": [],
+                    "test_accuracy": [],
+                    "train_time": 0.,
+                }
 
                 for epoch in range(epochs):
                     print(f"Epoch {epoch+1}")
                     self.model.train(True)
 
-                    avg_train_loss = self.train_one_epoch(optimizer, batch_size)
+                    train_loss, train_accuracy = self.train_one_epoch(_optimizer, batch_size)
+                    
+                    run_data["train_loss"].append(train_loss)
+                    run_data["train_accuracy"].append(train_accuracy)
 
-                    avg_test_loss = self.test_one_epoch(batch_size)
-
-                    run_data["train_loss"].append(avg_train_loss)
-                    run_data["test_loss"].append(avg_test_loss)
-
-                    if avg_test_loss < best_loss:
-                        best_loss = avg_test_loss
-                        model_path = f"/models/road_safety/{optimizer_name}_{scheduler_name}"
+                    test_loss, test_accuracy  = self.test_one_epoch(batch_size)
+                    run_data["test_loss"].append(test_loss)
+                    run_data["test_accuracy"].append(test_accuracy)
+                    
+                    print(f"\tAverage accuracy {np.mean(test_accuracy)}")
+                    
+                    if np.mean(test_loss) < best_loss:
+                        best_loss = np.mean(test_loss)
+                        model_path = Path(f"models/credit/{optimizer_name}_{scheduler_name}.pt")
+                        if not model_path.parents[0].exists():
+                            model_path.parents[0].mkdir(parents = True)
+                        
                         torch.save(self.model.state_dict(), model_path)
-                
-                    scheduler.step()
 
+                    if scheduler != optim.lr_scheduler.ReduceLROnPlateau:
+                        _scheduler.step()
+                    else:
+                        _scheduler.step(np.mean(test_loss))
+                
                 run_data["train_time"] = time() - t0
-                df[optimizer_name,scheduler_name] = run_data
+                df.at[optimizer_name,scheduler_name] = run_data
                 df.to_csv(result_csv)
 
-                self.model.to_cpu()
+                self.model.to("cpu")
+                
+                del self.model
+                del _optimizer
+                del _scheduler
             
         return df
     
@@ -242,23 +273,6 @@ class RoadSafety(BaseDataset):
         else:
             print("No model trained")
             return None
-
-    def infer(self, data, model: nn.Module, batch_size: int, device: Literal["cpu", "cuda"]) -> tuple[np.ndarray, float]:
-        t0 = time()
-        N = len(data["SexofDriver"])
-
-        preds = np.zeros((N))
-        idxs = np.arange(0,N, batch_size)
-
-        self.model.to_device(device)
-
-        print("Beginning inference")
-        with torch.no_grad():
-            for i, idx in enumerate(idxs):
-                print(f"\tbatch {i+1}")
-                preds[idx:np.min(idx+batch_size,N)] = model(list(data[idx:idx+batch_size].values())[:-1]).detach().to_cpu()
-
-        return preds, np.mean(int(preds) == data["SexofDriver"].values()), (time()-t0)/N
     
 
     
@@ -278,29 +292,39 @@ class PII(BaseDataset):
         self.tokenizer = None
         self.model = None
         self.metric = None
+        
+        self.label2id = dict()
+        self.id2label = dict()
 
     def load_tokenizer(
             self,
             tokenizer_path: Union[str, Path],
-            device: Literal["cpu", "cuda"]
+            device: Literal["cpu", "cuda"],
+            **kwargs
         ) -> None:
-        self.tokenizer = RobertaForTokenClassification.from_pretrained(tokenizer_path).to_device(device)
+        self.tokenizer = RobertaForTokenClassification.from_pretrained(tokenizer_path, **kwargs).to(device)
         return None
     
     def load_model(
             self, 
             model_path: Union[str, Path],
             device: Literal["cpu", "cuda"],
-            num_labels: int
+            num_labels: Optional[int] = 9,
+            **kwargs
         ) -> None:
-        self.model = RobertaForTokenClassification.from_pretrained(model_path, num_labels = num_labels).to_device(device)
+        self.model = RobertaForTokenClassification.from_pretrained(model_path, num_labels = num_labels, **kwargs).to(device)
         return None
 
     def prepare_dataset(self) -> None:
         assert(self.tokenizer != None), "Load the tokenizer and model first"
 
         def tokenize_and_align_labels(examples, label_all_tokens = True):
-            tokenized_inputs = self.tokenizer(examples["tokens"], truncation = True, is_split_into_words = True)
+            tokenized_inputs = self.tokenizer(
+                examples["tokens"], 
+                truncation = True, 
+                is_split_into_words = True,
+                return_tensors = "pt"
+            )
 
             labels = []
             for i, label in enumerate(examples["ner_tags"]):
@@ -325,6 +349,9 @@ class PII(BaseDataset):
 
         self.labels = self.dataset["train"].features["ner_tags"].feature.names
 
+        self.id2label = {i: label for i, label in enumerate(self.labels)}
+        self.label2id = {label: i for i, label in enumerate(self.labels)}
+        
         return None
     
     def compute_metrics(self, p) -> Dict[str, float]:
@@ -354,9 +381,10 @@ class PII(BaseDataset):
         }
     
     def train(
-            self, 
-            optimizers: Dict[Any, Any], 
-            schedulers: Dict[Any, Any],
+            self,
+            output_dir: Union[str, Path],
+            optimizers: Dict[str, Tuple[optim.Optimizer, Dict[str, Any]]], 
+            schedulers: Dict[str, Tuple[optim.lr_scheduler.LambdaLR,]],
             tokenizer_path: Union[str, Path],
             model_path: Union[str, Path],
             epochs: int,
@@ -389,11 +417,12 @@ class PII(BaseDataset):
                 self.data_collator = DataCollatorForTokenClassification(self.tokenzier)
                 
                 args = TrainingArguments(
-                    output_dir = "",
+                    output_dir = f"{output_dir}/{optimizer}_{scheduler}",
                     evaluation_strategy = "epoch",
                     per_device_train_batch_size = batch_size,
                     per_device_eval_batch_size = batch_size,
-                    num_train_epochs = epochs
+                    num_train_epochs = epochs,
+                    push_to_hub = False
                 )
 
                 t0 = time()
@@ -412,7 +441,8 @@ class PII(BaseDataset):
                 trainer.train()
 
                 predictions, labels, _ = trainer.predict(self.tokenized_dataset["test"])
-                predictions = np.argmax(predictions, axis = 2)
+                labels = labels.detach().to("cpu")
+                predictions = np.argmax(predictions.detach().to("cpu"), axis = 2)
 
                 true_predictions = [
                     [self.labels[p] for (p,l) in zip(prediction, label) if l != -100]
@@ -446,39 +476,75 @@ class SkinCancer(BaseDataset):
         self.dataset_name: str = "SkinCancer"
 
         self.dataset = load_dataset(
-            "marmal88/skin-cancer"
+            "marmal88/skin_cancer"
         )
+        self.processed_dataset = None
 
         self.model = None
-        self.image_processor = None
+        self.feature_extractor = None
+        
+        self.metric = load_metric("accuracy")
+        
+        self.label2id = dict()
+        self.id2label = dict()
 
     def prepare_dataset(self) -> None:
+        
+        labels = list(set(self.dataset["train"]["dx"]))
+        
+        self.label2id = {label: i for i, label in enumerate(labels)}
+        self.id2label = {i: label for i, label in enumerate(labels)}
+        
+        def preprocess(batch, device: Literal["cpu", "cuda"]):
+            inputs = self.feature_extractor(
+                batch["image"],
+                return_tensors = "pt"
+            )
+            
+            inputs["label"] = batch["dx"]
+            return inputs
+        
+        self.processed_dataset = self.dataset.with_transform(preprocess)
+        
         return None
+    
+    def data_collator(batch):
+        return {
+                "pixel_values": torch.stack([x["pixel_values"] for x in batch]),
+                "labels": torch.tensor([x["label"] for x in batch])
+            }
     
     def load_model(
             self, 
             model_path: Union[str, Path],
-            device: Literal["cpu", "cuda"]
+            device: Literal["cpu", "cuda"],
+            labels: int
         ) -> None:
-        self.model = MobileViTV2ForImageClassification.from_pretrained(model_path).to_device(device)
+        self.model = MobileViTV2ForImageClassification.from_pretrained(model_path, num_labels = labels).to(device)
         
         return None
     
-    def load_image_process(
+    def load_feature_extractor(
             self, 
-            image_processor_path: Union[str, Path],
+            feature_extractor_path: Union[str, Path],
             device: Literal["cpu", "cuda"]
         ) -> None:
 
-        self.image_processor = MobileViTImageProcessor.from_pretrained(image_processor_path).to_device(device)
+        self.feature_extractor = MobileViTFeatureExtractor.from_pretrained(feature_extractor_path).to(device)
 
-        return None
+    
+    def compute_metrics(self, p):
+        return self.metric.compute(
+            predictions = np.argmax(p.predictions, axis = 1),
+            references = p.label_ids
+        )
     
     def train(
             self,
+            output_dir: Union[str, Path],
             optimizers: Dict[Any, Any],
             schedulers: Dict[Any, Any],
-            image_processor_path: Union[str, Path],
+            feature_extractor_path: Union[str, Path],
             model_path: Union[str, Path],
             epochs: int,
             batch_size: int,
@@ -503,9 +569,45 @@ class SkinCancer(BaseDataset):
         for optimizer, optimizer_params in optimizers.items():
             for scheduler, scheduler_params in schedulers.items():
 
-                self.load_model(model_path, device)
-                self.load_image_process(image_processor_path, device)
+                self.load_model(model_path, device, len(self.id2label))
+                self.load_feature_extractor(feature_extractor_path, device)
 
+                args = TrainingArguments(
+                    output_dir = f"{output_dir}/{optimizer}_{scheduler}",
+                    evaluation_strategy = "epoch",
+                    per_device_train_batch_size = batch_size,
+                    per_device_eval_batch_size = batch_size,
+                    num_train_epochs = epochs,
+                    push_to_hub = False,
+                    
+                )
 
-        
+                t0 = time()
+
+                trainer = Trainer(
+                    self.model,
+                    args,
+                    train_dataset = self.processed_dataset["train"],
+                    eval_dataset = self.processed_dataset["validation"],
+                    tokenizer = self.feature_extractor,
+                    data_collator = self.data_collator,
+                    compute_metrics = self.compute_metrics,
+                    optimizer = (optimizer, scheduler)
+                )
+
+                trainer.train()
+                
+                predictions, labels, _ = trainer.predict(self.tokenized_dataset["text"])
+                labels = labels.detach().to("cpu")
+                predictions = predictions.detach().to("cpu")
+                
+                results = self.metric.compute(
+                    predictions = np.argmax(predictions, axis = 1),
+                    references = labels
+                )
+                
+                results["train_time"] = time() - t0
+                df[optimizer, scheduler] = results
+                df.to_csv(result_csv)
+                       
         return df
