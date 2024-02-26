@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 from torch import nn, optim
 
+import transformers
 from transformers import (
     RobertaForTokenClassification, 
     RobertaTokenizerFast,
@@ -27,7 +28,8 @@ from transformers import (
 )
 
 import datasets
-from datasets import load_dataset, load_metric
+from datasets import load_dataset
+import evaluate
 
 from project.utils import create_dir, set_seed
 from project.model import CreditDefaultNet
@@ -299,10 +301,9 @@ class PII(BaseDataset):
     def load_tokenizer(
             self,
             tokenizer_path: Union[str, Path],
-            device: Literal["cpu", "cuda"],
             **kwargs
         ) -> None:
-        self.tokenizer = RobertaForTokenClassification.from_pretrained(tokenizer_path, **kwargs).to(device)
+        self.tokenizer = RobertaTokenizerFast.from_pretrained(tokenizer_path, add_prefix_space = True, **kwargs)
         return None
     
     def load_model(
@@ -320,10 +321,9 @@ class PII(BaseDataset):
 
         def tokenize_and_align_labels(examples, label_all_tokens = True):
             tokenized_inputs = self.tokenizer(
-                examples["tokens"], 
+                examples["tokens"],
                 truncation = True, 
-                is_split_into_words = True,
-                return_tensors = "pt"
+                is_split_into_words = True
             )
 
             labels = []
@@ -340,7 +340,7 @@ class PII(BaseDataset):
                         label_ids.append(label[word_idx] if label_all_tokens else -100)
                     previous_word_idx = word_idx
 
-                label.append(label_ids)
+                labels.append(label_ids)
 
             tokenized_inputs["labels"] = labels
             return tokenized_inputs
@@ -356,7 +356,7 @@ class PII(BaseDataset):
     
     def compute_metrics(self, p) -> Dict[str, float]:
         if not self.metric:
-            self.metric = load_metric("seqeval")
+            self.metric = evaluate.load("seqeval")
 
         predictions, labels = p
         predictions = np.argmax(predictions, axis = 2)
@@ -383,46 +383,64 @@ class PII(BaseDataset):
     def train(
             self,
             output_dir: Union[str, Path],
-            optimizers: Dict[str, Tuple[optim.Optimizer, Dict[str, Any]]], 
-            schedulers: Dict[str, Tuple[optim.lr_scheduler.LambdaLR,]],
+            optimizers: Dict[str, Dict[str,Any]], 
+            schedulers: Dict[str, Dict[str,Any]],
             tokenizer_path: Union[str, Path],
             model_path: Union[str, Path],
+            strategy: Literal["epoch", "steps"],
             epochs: int,
             batch_size: int,
             result_csv: Union[str, Path],
             device: Literal["cpu", "cuda"]
         ) -> pd.DataFrame:
-        assert(self.model), "Instantiate a model"
-        assert(self.tokenizer), "Instantiate a tokenizer"
-        assert(self.tokenized_dataset), "Tokenize training dataset"
         
-        self.metric = load_metric("seqeval")
+        assert(self.labels), "Labels not found"
+        
+        self.load_tokenizer(tokenizer_path)
+        self.metric = evaluate.load("seqeval")
+        self.data_collator = DataCollatorForTokenClassification(self.tokenizer)
 
-        try: 
-            df = pd.read_csv(result_csv)
-        except:
-            df = pd.DataFrame(
-                np.zeros(len(optimizers.keys(),len(schedulers.keys()))), 
-                index = list(optimizers.keys()),
-                columns = list(schedulers.keys())
-            )
-            df.to_csv(result_csv)
+        df = pd.DataFrame(
+            index = list(optimizers.keys()),
+            columns = list(schedulers.keys())
+        )
+        df.to_csv(result_csv)
 
-        for optimizer, optimizer_params in optimizers.items():
-            for scheduler, scheduler_params in schedulers.items():
+        for optimizer_name, (optimizer, optimizer_params) in optimizers.items():
+            for scheduler_name, scheduler_params in schedulers.items():
+                
+                print("----------------------------")
+                print(f"Optimizer: {optimizer_name} | Scheduler: {scheduler_name}")
+                _scheduler_params = copy(scheduler_params)
                 
                 self.load_model(model_path, device)
-                self.load_tokenizer(tokenizer_path, len(self.labels), device)
 
-                self.data_collator = DataCollatorForTokenClassification(self.tokenzier)
+                self.model.config.id2label = self.id2label
+                self.model.config.label2id = self.label2id
+                
+                if optimizer == torch.optim.RMSprop:
+                    additional_args = {"weight_decay": 0.}
+                else:
+                    additional_args = dict()
                 
                 args = TrainingArguments(
-                    output_dir = f"{output_dir}/{optimizer}_{scheduler}",
-                    evaluation_strategy = "epoch",
+                    output_dir = f"{output_dir}/{optimizer_name}_{scheduler_name}",
+                    evaluation_strategy = strategy,
                     per_device_train_batch_size = batch_size,
                     per_device_eval_batch_size = batch_size,
                     num_train_epochs = epochs,
-                    push_to_hub = False
+                    push_to_hub = False,
+                    disable_tqdm = True,
+                    **additional_args
+                )
+                
+                _optimizer = optimizer(self.model.parameters(), **optimizer_params)
+                _scheduler = transformers.get_scheduler(
+                    scheduler_name, 
+                    _optimizer, 
+                    num_warmup_steps = _scheduler_params.pop("num_warmup_steps"),
+                    num_training_steps = epochs*len(self.tokenized_dataset["train"])//batch_size,
+                    scheduler_specific_kwargs = _scheduler_params
                 )
 
                 t0 = time()
@@ -435,14 +453,14 @@ class PII(BaseDataset):
                     tokenizer = self.tokenizer,
                     data_collator = self.data_collator,
                     compute_metrics = self.compute_metrics,
-                    optimizer = (optimizer, scheduler)
+                    optimizers = (_optimizer, _scheduler)
                 )
 
                 trainer.train()
 
                 predictions, labels, _ = trainer.predict(self.tokenized_dataset["test"])
-                labels = labels.detach().to("cpu")
-                predictions = np.argmax(predictions.detach().to("cpu"), axis = 2)
+                labels = labels
+                predictions = np.argmax(predictions, axis = 2)
 
                 true_predictions = [
                     [self.labels[p] for (p,l) in zip(prediction, label) if l != -100]
@@ -453,13 +471,21 @@ class PII(BaseDataset):
                     [self.labels[l] for (p,l) in zip(prediction, label) if l != -100]
                     for prediction, label in zip(predictions, labels) 
                 ]
-
+                
                 results = self.metric.compute(predictions = true_predictions, references = true_labels)
                 results["train_time"] = time() - t0
+                results["log"] = trainer.state.log_history
 
-                df[optimizer,scheduler] = results
+                df.at[optimizer_name,scheduler_name] = results
                 df.to_csv(result_csv)
+                
+                del _optimizer
+                del _scheduler
+                del self.model
+                del trainer
 
+        torch.cuda.empty_cache()
+        
         return df
     
     def infer(self):
@@ -468,7 +494,7 @@ class PII(BaseDataset):
         return None
     
 
-class SkinCancer(BaseDataset):
+class SkinCancer(BaseDataset): 
 
     def __init__(self):
         super().__init__()
