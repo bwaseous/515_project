@@ -18,20 +18,20 @@ import transformers
 from transformers import (
     RobertaForTokenClassification, 
     RobertaTokenizerFast,
-    RobertaConfig,
-    MobileViTV2ForImageClassification,
-    MobileViTFeatureExtractor,
-    MobileViTV2Config,
+    MobileViTForImageClassification,
+    MobileViTImageProcessor,
     Trainer,
     TrainingArguments,
-    DataCollatorForTokenClassification
+    DataCollatorForTokenClassification,
+    DefaultDataCollator
 )
+
+from torchvision.transforms import v2
 
 import datasets
 from datasets import load_dataset
 import evaluate
 
-from project.utils import create_dir, set_seed
 from project.model import CreditDefaultNet
 
 from typing import List, Union, Optional, Dict, Tuple, Any, Literal
@@ -507,105 +507,146 @@ class SkinCancer(BaseDataset):
         self.processed_dataset = None
 
         self.model = None
-        self.feature_extractor = None
+        self.image_processor = None
         
-        self.metric = load_metric("accuracy")
+        self.metric = evaluate.load("accuracy")
         
+        self.labels = list()
         self.label2id = dict()
         self.id2label = dict()
 
     def prepare_dataset(self) -> None:
         
-        labels = list(set(self.dataset["train"]["dx"]))
+        self.labels = list(set(self.dataset["train"]["dx"]))
         
-        self.label2id = {label: i for i, label in enumerate(labels)}
-        self.id2label = {i: label for i, label in enumerate(labels)}
+        self.label2id = {label: i for i, label in enumerate(self.labels)}
+        self.id2label = {i: label for i, label in enumerate(self.labels)}
+        size = (
+            self.image_processor.size["shortest_edge"] 
+            if "shortest_edge" in self.image_processor.size
+            else (self.image_processor.size["height"], self.image_processor.size["width"])
+        )
         
-        def preprocess(batch, device: Literal["cpu", "cuda"]):
-            inputs = self.feature_extractor(
-                batch["image"],
-                return_tensors = "pt"
-            )
-            
-            inputs["label"] = batch["dx"]
-            return inputs
+        self._transforms = v2.Compose([
+            v2.ToImage(),
+            v2.ToDtype(torch.uint8, scale = True),
+            v2.RandomResizedCrop(size), 
+            v2.ToDtype(torch.float32, scale = True),
+            v2.GaussianBlur(kernel_size = (5,9), sigma = (0.1,5)),
+            v2.ColorJitter(brightness = .5, contrast = .5, saturation = .5),
+            v2.RandomRotation(degrees = (0,180))
+        ])
         
-        self.processed_dataset = self.dataset.with_transform(preprocess)
+        def transforms(examples):
+            examples["pixel_values"] = [self._transforms(img.convert("RGB")) for img in examples["image"]]
+            del examples["image"]
+            del examples["age"]
+            del examples["image_id"]
+            del examples['lesion_id']
+            del examples["dx_type"]
+            del examples["sex"]
+            del examples["localization"]
+            examples["labels"] = [self.label2id[label] for label in examples["dx"]]
+            del examples["dx"]
+            return examples
+        
+        self.processed_dataset = self.dataset.with_transform(transforms)
         
         return None
-    
-    def data_collator(batch):
-        return {
-                "pixel_values": torch.stack([x["pixel_values"] for x in batch]),
-                "labels": torch.tensor([x["label"] for x in batch])
-            }
     
     def load_model(
             self, 
             model_path: Union[str, Path],
-            device: Literal["cpu", "cuda"],
-            labels: int
+            device: Literal["cpu", "cuda"]
         ) -> None:
-        self.model = MobileViTV2ForImageClassification.from_pretrained(model_path, num_labels = labels).to(device)
+        assert(self.labels), "Load dataset"
+        
+        self.model = MobileViTForImageClassification.from_pretrained(
+            model_path, 
+            num_labels = len(self.labels),
+            ignore_mismatched_sizes = True
+        ).to(device)
+        
+        self.model.config.id2label = self.id2label
+        self.model.config.label2id = self.label2id
         
         return None
     
-    def load_feature_extractor(
+    def load_image_processor(
             self, 
-            feature_extractor_path: Union[str, Path],
-            device: Literal["cpu", "cuda"]
+            image_processor_path: Union[str, Path]
         ) -> None:
 
-        self.feature_extractor = MobileViTFeatureExtractor.from_pretrained(feature_extractor_path).to(device)
+        self.image_processor = MobileViTImageProcessor.from_pretrained(image_processor_path)
+        
+        return None
 
     
     def compute_metrics(self, p):
-        return self.metric.compute(
-            predictions = np.argmax(p.predictions, axis = 1),
-            references = p.label_ids
-        )
+        predictions, labels = p
+        predictions = np.argmax(predictions, axis = 1)
+        return self.metric.compute(predictions=predictions, references=labels)
     
     def train(
             self,
             output_dir: Union[str, Path],
             optimizers: Dict[Any, Any],
             schedulers: Dict[Any, Any],
-            feature_extractor_path: Union[str, Path],
+            image_processor_path: Union[str, Path],
             model_path: Union[str, Path],
+            strategy: Literal["epoch", "steps"],
             epochs: int,
             batch_size: int,
             result_csv: Union[str, Path],
             device: Literal["cpu", "cuda"]
         ) -> pd.DataFrame:
 
-        assert(self.model), "Instantiate a model"
-        assert(self.tokenizer), "Instantiate a tokenizer"
-        assert(self.tokenized_dataset), "Tokenize the training dataset"
-
-        try: 
-            df = pd.read_csv(result_csv)
-        except:
-            df = pd.DataFrame(
-                np.zeros(len(optimizers.keys(),len(schedulers.keys()))), 
-                index = list(optimizers.keys()),
-                columns = list(schedulers.keys())
-            )
-            df.to_csv(result_csv)
+        assert(self.labels), "Labels not found"
         
-        for optimizer, optimizer_params in optimizers.items():
-            for scheduler, scheduler_params in schedulers.items():
+        self.data_collator = DefaultDataCollator()
+        
+        self.load_image_processor(image_processor_path)
 
-                self.load_model(model_path, device, len(self.id2label))
-                self.load_feature_extractor(feature_extractor_path, device)
+        df = pd.DataFrame(
+            index = list(optimizers.keys()),
+            columns = list(schedulers.keys())
+        )
+        df.to_csv(result_csv)
+        
+        for optimizer_name, (optimizer, optimizer_params) in optimizers.items():
+            for scheduler_name, scheduler_params in schedulers.items():
 
+
+                print("----------------------------")
+                print(f"Optimizer: {optimizer_name} | Scheduler: {scheduler_name}")
+                _scheduler_params = copy(scheduler_params)
+                
+                self.load_model(model_path, device)
+
+                if optimizer == torch.optim.RMSprop:
+                    additional_args = {"weight_decay": 0.}
+                else:
+                    additional_args = dict()
+                
                 args = TrainingArguments(
-                    output_dir = f"{output_dir}/{optimizer}_{scheduler}",
-                    evaluation_strategy = "epoch",
+                    output_dir = f"{output_dir}/{optimizer_name}_{scheduler_name}",
+                    evaluation_strategy = strategy,
                     per_device_train_batch_size = batch_size,
                     per_device_eval_batch_size = batch_size,
                     num_train_epochs = epochs,
                     push_to_hub = False,
-                    
+                    remove_unused_columns = False,
+                    #disable_tqdm = True,
+                    **additional_args
+                )
+
+                _optimizer = optimizer(self.model.parameters(), **optimizer_params)
+                _scheduler = transformers.get_scheduler(
+                    scheduler_name, 
+                    _optimizer, 
+                    num_warmup_steps = _scheduler_params.pop("num_warmup_steps"),
+                    num_training_steps = epochs*len(self.processed_dataset["train"])//batch_size,
+                    scheduler_specific_kwargs = _scheduler_params
                 )
 
                 t0 = time()
@@ -615,17 +656,15 @@ class SkinCancer(BaseDataset):
                     args,
                     train_dataset = self.processed_dataset["train"],
                     eval_dataset = self.processed_dataset["validation"],
-                    tokenizer = self.feature_extractor,
+                    tokenizer = self.image_processor,
                     data_collator = self.data_collator,
                     compute_metrics = self.compute_metrics,
-                    optimizer = (optimizer, scheduler)
+                    optimizers = (_optimizer, _scheduler)
                 )
 
                 trainer.train()
                 
-                predictions, labels, _ = trainer.predict(self.tokenized_dataset["text"])
-                labels = labels.detach().to("cpu")
-                predictions = predictions.detach().to("cpu")
+                predictions, labels, _ = trainer.predict(self.processed_dataset["test"])
                 
                 results = self.metric.compute(
                     predictions = np.argmax(predictions, axis = 1),
@@ -633,7 +672,15 @@ class SkinCancer(BaseDataset):
                 )
                 
                 results["train_time"] = time() - t0
-                df[optimizer, scheduler] = results
+                results["log"] = trainer.state.log_history
+                df[optimizer_name, scheduler_name] = results
                 df.to_csv(result_csv)
+                
+                del _optimizer
+                del _scheduler
+                del self.model
+                del trainer
                        
+        torch.cuda.empty_cache()               
+        
         return df
