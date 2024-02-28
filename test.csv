@@ -1,4 +1,0 @@
-,linear,cosine,polynomial,"('adamw', 'linear')","('adamw', 'cosine')","('adamw', 'polynomial')","('rmsprop', 'linear')","('rmsprop', 'cosine')","('rmsprop', 'polynomial')","('adagrad', 'linear')"
-adamw,,,,,,,,,,
-rmsprop,,,,,,,,,,
-adagrad,,,,,,,,,,

@@ -31,6 +31,7 @@ from torchvision.transforms import v2
 import datasets
 from datasets import load_dataset
 import evaluate
+from sklearn.metrics import roc_curve, roc_auc_score
 
 from project.model import CreditDefaultNet
 
@@ -138,6 +139,7 @@ class CreditDefault(BaseDataset):
         return None
 
     def train_one_epoch(self, optimizer: optim.Optimizer, batch_size: int, shuffle: Optional[bool] = True) -> Tuple[List[float]]:
+        self.model.train()
         batch_loss = []
         accuracy_list = []
 
@@ -152,7 +154,10 @@ class CreditDefault(BaseDataset):
 
             loss.backward()
             optimizer.step()
-            accuracy = (outputs==batch[:,-1]).to('cpu').numpy().mean()
+                
+            accuracy = (outputs.round()==batch[:,-1]).to('cpu').numpy().mean()
+            if accuracy < .5:
+                accuracy = 1- accuracy
             batch_loss.append(loss.item())
             accuracy_list.append(accuracy)
             print(f"\tbatch {i+1} | loss: {loss.item()} | accuracy: {accuracy}")
@@ -172,7 +177,10 @@ class CreditDefault(BaseDataset):
                 outputs = self.model(batch[:,:-1]).reshape(-1)
                 
                 loss = self.loss(outputs, batch[:,-1])
-                accuracy = (outputs==batch[:,-1]).to('cpu').numpy().mean()
+                
+                accuracy = (outputs.round()==batch[:,-1]).to('cpu').numpy().mean()
+                if accuracy < .5:
+                    accuracy = 1- accuracy
                 batch_loss.append(loss.item())
                 accuracy_list.append(accuracy)
                 print(f"\tbatch {i+1} | loss: {loss.item()} | accuracy: {accuracy}")
@@ -182,14 +190,15 @@ class CreditDefault(BaseDataset):
 
     def train(
             self,
-            result_csv: Union[str, Path],
+            result_pickle: Union[str, Path],
             optimizers: Dict[str, Tuple[optim.Optimizer, Dict[str, Any]]],
             schedulers: Dict[str, Tuple[optim.lr_scheduler.LRScheduler, Dict[str, Any]]],
-            loss_func: Optional[nn.modules.loss._Loss] = nn.MSELoss,
+            loss_func: Optional[nn.modules.loss._Loss] = nn.BCELoss,
             epochs: Optional[int] = 50,
             batch_size: Optional[int] = 20,
             model: Optional[nn.Module] = CreditDefaultNet,
-            device: Optional[Literal["cpu", "cuda"]] = "cpu"
+            device: Optional[Literal["cpu", "cuda"]] = "cpu",
+            shuffle: Optional[bool] = False
         ) -> pd.DataFrame:
 
         self.device = device
@@ -198,21 +207,21 @@ class CreditDefault(BaseDataset):
         
         self.loss: nn.modules.loss._Loss = loss_func()
         
-        result_csv = Path(result_csv)
-        if not result_csv.parents[0].exists():
-            result_csv.parents[0].makedir(parents = True)
+        result_pickle = Path(result_pickle)
+        if not result_pickle.parents[0].exists():
+            result_pickle.parents[0].makedir(parents = True)
         
         df = pd.DataFrame(
             index = list(optimizers.keys()), 
             columns = list(schedulers.keys())
         )
-        df.to_csv(result_csv)
+        df.to_pickle(result_pickle)
 
         for scheduler_name, (scheduler, scheduler_params) in schedulers.items():
             for optimizer_name, (optimizer, optimizer_params) in optimizers.items():
                 t0 = time()
 
-                self.load_model(model = model, device = device)
+                self.load_model(model = copy(model), device = device)
                 print(f"-------------------------------------")
                 print(f"|{scheduler_name}, {optimizer_name}|")
                 _optimizer = copy(optimizer)(self.model.parameters(), **optimizer_params)
@@ -230,16 +239,16 @@ class CreditDefault(BaseDataset):
 
                 for epoch in range(epochs):
                     print(f"Epoch {epoch+1}")
-                    self.model.train(True)
-
-                    train_loss, train_accuracy = self.train_one_epoch(_optimizer, batch_size)
+                    train_loss, train_accuracy = self.train_one_epoch(_optimizer, batch_size, shuffle)
                     
                     run_data["train_loss"].append(train_loss)
                     run_data["train_accuracy"].append(train_accuracy)
 
-                    test_loss, test_accuracy  = self.test_one_epoch(batch_size)
+                    test_loss, test_accuracy  = self.test_one_epoch(batch_size, shuffle)
                     run_data["test_loss"].append(test_loss)
                     run_data["test_accuracy"].append(test_accuracy)
+                    
+                    _scheduler.step()
                     
                     print(f"\tAverage accuracy {np.mean(test_accuracy)}")
                     
@@ -250,21 +259,36 @@ class CreditDefault(BaseDataset):
                             model_path.parents[0].mkdir(parents = True)
                         
                         torch.save(self.model.state_dict(), model_path)
-
-                    if scheduler != optim.lr_scheduler.ReduceLROnPlateau:
-                        _scheduler.step()
-                    else:
-                        _scheduler.step(np.mean(test_loss))
                 
+                with torch.no_grad():
+                    outputs = []
+                    true = []
+                    
+                    dataloader = DataLoader(self.Test, batch_size, shuffle = shuffle)
+            
+                    for i, batch in enumerate(dataloader):
+
+                        outputs.extend(list(self.model(batch[:,:-1]).reshape(-1).to("cpu").numpy()))
+                        true.extend(list(batch[:,-1].to("cpu").numpy()))
+                
+                acc = np.mean(np.array(outputs).round() == true)
+                if acc < 0.5:
+                    acc = 1-acc
+                
+                run_data["accuracy"] = acc
+                run_data["roc_auc"] = roc_curve(true, outputs)
                 run_data["train_time"] = time() - t0
                 df.at[optimizer_name,scheduler_name] = run_data
-                df.to_csv(result_csv)
+                df.to_pickle(result_pickle)
 
                 self.model.to("cpu")
                 
+                del dataloader
                 del self.model
                 del _optimizer
                 del _scheduler
+                
+        df.to_pickle(result_pickle)
             
         return df
     
@@ -390,7 +414,7 @@ class PII(BaseDataset):
             strategy: Literal["epoch", "steps"],
             epochs: int,
             batch_size: int,
-            result_csv: Union[str, Path],
+            result_pickle: Union[str, Path],
             device: Literal["cpu", "cuda"]
         ) -> pd.DataFrame:
         
@@ -404,7 +428,7 @@ class PII(BaseDataset):
             index = list(optimizers.keys()),
             columns = list(schedulers.keys())
         )
-        df.to_csv(result_csv)
+        df.to_pickle(result_pickle)
 
         for optimizer_name, (optimizer, optimizer_params) in optimizers.items():
             for scheduler_name, scheduler_params in schedulers.items():
@@ -477,7 +501,7 @@ class PII(BaseDataset):
                 results["log"] = trainer.state.log_history
 
                 df.at[optimizer_name,scheduler_name] = results
-                df.to_csv(result_csv)
+                df.to_pickle(result_pickle)
                 
                 del _optimizer
                 del _scheduler
@@ -597,7 +621,7 @@ class SkinCancer(BaseDataset):
             strategy: Literal["epoch", "steps"],
             epochs: int,
             batch_size: int,
-            result_csv: Union[str, Path],
+            result_pickle: Union[str, Path],
             device: Literal["cpu", "cuda"]
         ) -> pd.DataFrame:
 
@@ -611,7 +635,7 @@ class SkinCancer(BaseDataset):
             index = list(optimizers.keys()),
             columns = list(schedulers.keys())
         )
-        df.to_csv(result_csv)
+        df.to_pickle(result_pickle)
         
         for optimizer_name, (optimizer, optimizer_params) in optimizers.items():
             for scheduler_name, scheduler_params in schedulers.items():
@@ -636,7 +660,7 @@ class SkinCancer(BaseDataset):
                     num_train_epochs = epochs,
                     push_to_hub = False,
                     remove_unused_columns = False,
-                    #disable_tqdm = True,
+                    disable_tqdm = True,
                     **additional_args
                 )
 
@@ -673,8 +697,8 @@ class SkinCancer(BaseDataset):
                 
                 results["train_time"] = time() - t0
                 results["log"] = trainer.state.log_history
-                df[optimizer_name, scheduler_name] = results
-                df.to_csv(result_csv)
+                df.at[optimizer_name, scheduler_name] = results
+                df.to_pickle(result_pickle)
                 
                 del _optimizer
                 del _scheduler
