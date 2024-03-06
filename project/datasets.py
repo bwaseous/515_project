@@ -75,20 +75,6 @@ class BaseDataset:
 
         return NotImplementedError
     
-    def get_model(self):
-        """
-        Method to retrieve trained model
-        """
-
-        return NotImplementedError
-    
-    def infer(self):
-        """
-        Method to run inference on fine-tuned model
-        """
-
-        return NotImplementedError
-    
 
 
 class CreditDefault(BaseDataset):
@@ -303,12 +289,12 @@ class CreditDefault(BaseDataset):
 
     
 
-class PII(BaseDataset):
+class NER(BaseDataset):
 
     def __init__(self):
         super().__init__()
 
-        self.dataset_name: str = "PII"
+        self.dataset_name: str = "NER"
 
         self.dataset = load_dataset(
             path = "conll2003"
@@ -511,11 +497,6 @@ class PII(BaseDataset):
         torch.cuda.empty_cache()
         
         return df
-    
-    def infer(self):
-        assert (self.model and self.tokenizer), "Load a trained tokenizer and model"
-
-        return None
     
 
 class SkinCancer(BaseDataset): 
